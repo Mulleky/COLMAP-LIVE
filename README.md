@@ -1,38 +1,43 @@
-# COLMAP Live / Incremental Image Processor
+# COLMAP Live Pipeline
 
-This folder contains scripts to process images one by one with COLMAP and keep updating a sparse model as new images become available.
+This repository contains small scripts for processing images with COLMAP as they arrive, keeping a sparse model updated, logging reconstruction/resource metrics, and plotting the resulting run data.
 
-It supports two modes:
+It is a practical approximation of online/incremental SfM. It is not true real-time SLAM, but it is useful for camera streams, image folders that grow over time, and experiments where you want repeated sparse-model updates.
 
-1. **Batch mode**: all images are already in the folder, and the script processes them one by one.
-2. **Watch mode**: the script keeps watching the image folder and processes new incoming images as they appear.
-
-This is a practical COLMAP-based approximation of online/incremental SfM. It is not true real-time SLAM, but it is useful for testing a workflow where images arrive sequentially and the sparse model is updated repeatedly.
-
----
-
-## Folder structure
+## Contents
 
 ```text
 colmap_live_pipeline/
-├── colmap_live.sh
-├── config.env
-├── run_example_carlos_paths.sh
+├── colmap_live.sh              Main COLMAP live/incremental pipeline
+├── config.env                  Example configuration file
+├── monitor_system_usage.py     CPU/RAM/NVIDIA GPU usage logger
+├── plot_colmap_run_metrics.py  Plot reconstruction and resource metrics
+├── colmap_ros2_cam.sh          Optional ROS 2 camera image capture helper
 └── README.md
 ```
 
-Your COLMAP working folder will look like this after running:
+## Requirements
+
+- COLMAP available in `PATH`, or pass `--colmap-bin /path/to/colmap`.
+- Python 3.
+- `matplotlib` for plotting.
+- Optional: `nvidia-smi` and a COLMAP build with CUDA support for NVIDIA GPU SIFT extraction/matching.
+
+## Workspace Layout
+
+You provide an image folder and a separate workspace folder. The pipeline writes all COLMAP outputs, logs, and metrics into the workspace.
 
 ```text
-/home/carlos/colmap_test/
+your_project/
 ├── images/
 │   ├── frame_0001.jpg
 │   ├── frame_0002.jpg
 │   └── ...
-└── sequential/
+└── workspace/
     ├── database.db
     ├── processed_images.txt
     ├── pointcloud_log.json
+    ├── resource_usage_log.json
     ├── sparse_live/
     │   ├── cameras.bin
     │   ├── images.bin
@@ -45,174 +50,112 @@ Your COLMAP working folder will look like this after running:
     └── tmp/
 ```
 
----
+## What `colmap_live.sh` Does
 
-## What the script does
-
-For each image in the image folder:
+For each new image:
 
 ```text
-new image
-  ↓
-extract COLMAP features only for that image
-  ↓
-match it against the database
-  ↓
-if no sparse model exists:
-    try to initialize a sparse model
-else:
-    register new image into current model
-    triangulate new points
-    optionally run bundle adjustment
-  ↓
-export/update sparse_live.ply
-  ↓
-append stats to pointcloud_log.json
+extract features for the new image
+match features in the accumulated database
+initialize a sparse model if none exists yet
+otherwise register the image into the live model
+triangulate new points
+optionally run bundle adjustment
+optionally rebuild from the database if incremental triangulation fails
+export sparse_live.ply
+append reconstruction stats to pointcloud_log.json
 ```
 
-Important: the first image usually cannot produce a 3D sparse cloud. You normally need multiple images with enough overlap and baseline before COLMAP can initialize a model.
+In parallel, the script can run `monitor_system_usage.py` and log CPU, RAM, and NVIDIA GPU usage to `resource_usage_log.json`.
 
----
+The first image normally cannot produce a 3D sparse cloud. You need multiple images with overlap and baseline before COLMAP can initialize a model.
 
-## JSON stats log
+## Quick Start
 
-Every time a sparse point cloud/model is successfully initialized or updated, the script appends one JSON object to:
-
-```text
-/home/carlos/colmap_test/sequential/pointcloud_log.json
-```
-
-The file is a JSON array, not JSONL.
-
-Example:
-
-```json
-[
-  {
-    "point_cloud_id": 1,
-    "timestamp_utc": "2026-05-13T19:45:00.000000+00:00",
-    "event": "initialized",
-    "trigger_image": "frame_0004.jpg",
-    "counts": {
-      "processed_images_including_trigger": 4,
-      "registered_images_in_sparse_model": 4,
-      "cameras_in_sparse_model": 1,
-      "sparse_3d_points": 1532
-    },
-    "quality_summary": {
-      "mean_observations_per_registered_image": 920.5,
-      "mean_track_length": 3.2
-    },
-    "paths": {
-      "workspace": "/home/carlos/colmap_test/sequential",
-      "image_path": "/home/carlos/colmap_test/images",
-      "database_path": "/home/carlos/colmap_test/sequential/database.db",
-      "live_model_path": "/home/carlos/colmap_test/sequential/sparse_live",
-      "output_ply": "/home/carlos/colmap_test/sequential/sparse_live.ply",
-      "output_ply_exists": true,
-      "output_ply_size_bytes": 123456
-    },
-    "settings": {
-      "matcher": "sequential",
-      "camera_model": "PINHOLE",
-      "single_camera": true,
-      "sequential_overlap": 10,
-      "bundle_adjustment_enabled": true,
-      "ply_export_enabled": true
-    }
-  }
-]
-```
-
-The most important fields are:
-
-```text
-counts.sparse_3d_points
-counts.registered_images_in_sparse_model
-counts.processed_images_including_trigger
-quality_summary.mean_track_length
-```
-
----
-
-## Setup
-
-Unzip the downloaded folder, then go into it:
-
-```bash
-cd /path/to/colmap_live_pipeline
-```
-
-Make the scripts executable:
+Make the scripts executable once:
 
 ```bash
 chmod +x colmap_live.sh
-chmod +x run_example_carlos_paths.sh
+chmod +x monitor_system_usage.py
+chmod +x plot_colmap_run_metrics.py
 ```
 
-You only need to do that once.
-
----
-
-## Option A: Run with Carlos' current paths
-
-Process all existing images once:
-
-```bash
-./run_example_carlos_paths.sh
-```
-
-Start fresh and process all existing images:
-
-```bash
-./run_example_carlos_paths.sh --reset
-```
-
-Watch for new incoming images:
-
-```bash
-./run_example_carlos_paths.sh --watch
-```
-
-Stop watch mode with:
-
-```text
-Ctrl+C
-```
-
----
-
-## Option B: Run with command-line paths
-
-Process all existing images once:
+Run once on an existing image folder:
 
 ```bash
 ./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images
+  --workspace /path/to/project/workspace \
+  --image-path /path/to/project/images
 ```
 
-Start fresh and process all existing images:
+Start fresh:
 
 ```bash
 ./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images \
+  --workspace /path/to/project/workspace \
+  --image-path /path/to/project/images \
   --reset
 ```
 
-Watch for new incoming images:
+Watch for newly arriving images:
 
 ```bash
 ./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images \
+  --workspace /path/to/project/workspace \
+  --image-path /path/to/project/images \
   --watch
 ```
 
----
+Stop watch mode with `Ctrl+C`.
 
-## Option C: Run with `config.env`
+## Local Usage On This Machine
+
+For the current local workspace in this folder, use:
+
+```bash
+cd /home/carlos/colmap_live_pipeline
+```
+
+Run the COLMAP live pipeline on the local `images/` folder and write outputs to `sequential/`:
+
+```bash
+./colmap_live.sh \
+  --workspace /home/carlos/colmap_live_pipeline/sequential \
+  --image-path /home/carlos/colmap_live_pipeline/images
+```
+
+Start fresh with:
+
+```bash
+./colmap_live.sh \
+  --workspace /home/carlos/colmap_live_pipeline/sequential \
+  --image-path /home/carlos/colmap_live_pipeline/images \
+  --reset
+```
+
+Watch for new images from the ROS/camera capture script:
+
+```bash
+./colmap_live.sh \
+  --workspace /home/carlos/colmap_live_pipeline/sequential \
+  --image-path /home/carlos/colmap_live_pipeline/images \
+  --watch
+```
+
+The local JSON logs are:
+
+```text
+/home/carlos/colmap_live_pipeline/sequential/pointcloud_log.json
+/home/carlos/colmap_live_pipeline/sequential/resource_usage_log.json
+```
+
+The local sparse PLY output is:
+
+```text
+/home/carlos/colmap_live_pipeline/sequential/sparse_live.ply
+```
+
+## Run With `config.env`
 
 Edit `config.env`:
 
@@ -220,11 +163,11 @@ Edit `config.env`:
 nano config.env
 ```
 
-Set:
+Set the two required paths:
 
 ```bash
-WORKSPACE="/home/carlos/colmap_test/sequential"
-IMAGE_PATH="/home/carlos/colmap_test/images"
+WORKSPACE="/path/to/project/workspace"
+IMAGE_PATH="/path/to/project/images"
 ```
 
 Then run:
@@ -233,66 +176,33 @@ Then run:
 ./colmap_live.sh --config config.env
 ```
 
-Watch mode:
-
-```bash
-./colmap_live.sh --config config.env --watch
-```
-
-Reset and rerun:
+Common variants:
 
 ```bash
 ./colmap_live.sh --config config.env --reset
+./colmap_live.sh --config config.env --watch
 ```
 
----
+## Important Options
 
-## Useful flags
+### Matching
 
-### Change JSON log path
-
-```bash
-./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images \
-  --stats-json /home/carlos/colmap_test/sequential/my_stats.json
-```
-
-### Disable JSON stats logging
-
-```bash
-./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images \
-  --no-stats
-```
-
-### Change matcher
-
-For video/drone-like image sequences:
+For ordered image streams such as video frames or robot/camera sequences:
 
 ```bash
 --matcher sequential
+--sequential-overlap 10
 ```
 
-For small unordered image sets:
+For small unordered image collections:
 
 ```bash
 --matcher exhaustive
 ```
 
-Example:
+### Camera Model
 
-```bash
-./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images \
-  --matcher exhaustive
-```
-
-### Change camera model
-
-Examples:
+Common choices:
 
 ```bash
 --camera-model PINHOLE
@@ -301,119 +211,214 @@ Examples:
 --camera-model OPENCV
 ```
 
-Example:
+If all images come from the same physical camera, keep:
+
+```bash
+--single-camera 1
+```
+
+### GPU SIFT
+
+COLMAP exposes GPU acceleration for SIFT feature extraction and matching:
+
+```bash
+--use-gpu 1
+--gpu-index -1
+```
+
+`GPU_INDEX=-1` lets COLMAP choose automatically. Use CPU-only SIFT with:
+
+```bash
+--use-gpu 0
+```
+
+This flag does not force every COLMAP step onto the GPU. Mapping, triangulation, and bundle adjustment do not use this same script-level GPU switch.
+
+### Resource Monitoring
+
+Resource monitoring is enabled by default:
+
+```bash
+LOG_RESOURCES="1"
+RESOURCE_SAMPLE_SECONDS="1"
+```
+
+Disable it:
+
+```bash
+./colmap_live.sh --config config.env --no-resource-monitor
+```
+
+Choose a different resource log path or sample rate:
 
 ```bash
 ./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images \
-  --camera-model SIMPLE_RADIAL
+  --config config.env \
+  --resource-json /path/to/project/workspace/resource_usage_log.json \
+  --resource-sample-seconds 2
 ```
 
-### Skip bundle adjustment for speed
+If `nvidia-smi` is unavailable or no NVIDIA GPU is detected, CPU/RAM samples are still logged and GPU fields are written as `null`.
+
+### Rebuild Fallback
+
+The incremental update path can sometimes get stuck with a weak sparse model. If `point_triangulator` fails or produces a degraded model, the script can run a full COLMAP `mapper` rebuild from the accumulated database and replace `sparse_live` with the best rebuilt model.
+
+This fallback is enabled by default:
+
+```bash
+REBUILD_ON_TRIANGULATION_FAILURE="1"
+```
+
+Disable it:
+
+```bash
+./colmap_live.sh --config config.env --no-rebuild-fallback
+```
+
+### Other Useful Flags
+
+Skip bundle adjustment for speed:
 
 ```bash
 --no-ba
 ```
 
-This makes updates faster but less refined.
-
-### Disable PLY export
+Disable PLY export:
 
 ```bash
 --no-ply
 ```
 
-Useful if you only care about COLMAP `.bin` sparse model files.
+Disable reconstruction JSON stats:
 
----
-
-## Output files
-
-Current sparse model:
-
-```text
-/home/carlos/colmap_test/sequential/sparse_live/
+```bash
+--no-stats
 ```
 
-Expected files after a model exists:
+Use custom output paths:
 
-```text
-cameras.bin
-images.bin
-points3D.bin
+```bash
+--database-path /path/to/workspace/database.db
+--live-model-path /path/to/workspace/sparse_live
+--output-ply /path/to/workspace/sparse_live.ply
+--processed-list /path/to/workspace/processed_images.txt
+--stats-json /path/to/workspace/pointcloud_log.json
 ```
 
-Current PLY export:
+## Metrics JSON Files
+
+### Reconstruction Metrics
+
+`pointcloud_log.json` is a JSON array with one record per initialized, updated, or rebuilt sparse model.
+
+Important fields:
 
 ```text
-/home/carlos/colmap_test/sequential/sparse_live.ply
+counts.sparse_3d_points
+counts.registered_images_in_sparse_model
+counts.processed_images_including_trigger
+quality_summary.mean_track_length
+quality_summary.mean_observations_per_registered_image
 ```
 
-JSON stats log:
+### Resource Metrics
+
+`resource_usage_log.json` is a JSON array of time samples.
+
+Important fields:
 
 ```text
-/home/carlos/colmap_test/sequential/pointcloud_log.json
+elapsed_seconds
+cpu_percent
+memory_percent
+gpu_utilization_percent
+gpu_memory_utilization_percent
+gpu_memory_used_mib
 ```
 
-Logs:
+`memory_percent` is system RAM usage. `gpu_memory_utilization_percent` is NVIDIA GPU VRAM usage.
+
+## Plot Metrics
+
+By default on this machine, `plot_colmap_run_metrics.py` reads:
+
+```python
+POINTCLOUD_JSON = Path("/home/carlos/colmap_live_pipeline/sequential/pointcloud_log.json")
+RESOURCE_JSON = POINTCLOUD_JSON.parent / "resource_usage_log.json"
+OUTPUT_DIR = POINTCLOUD_JSON.parent / "run_metric_plots"
+```
+
+Run:
+
+```bash
+cd /home/carlos/colmap_live_pipeline
+python3 plot_colmap_run_metrics.py
+```
+
+Plots are saved to:
 
 ```text
-/home/carlos/colmap_test/sequential/logs/
+/home/carlos/colmap_live_pipeline/sequential/run_metric_plots
 ```
 
-Processed image list:
+The plotter skips missing data gracefully, for example if no resource log exists or no GPU values were recorded.
+
+Generated plots can include:
 
 ```text
-/home/carlos/colmap_test/sequential/processed_images.txt
+sparse_point_count.png
+processed_vs_registered_images.png
+mean_track_length.png
+mean_observations_per_image.png
+cpu_usage_percent.png
+memory_usage_percent.png
+gpu_usage_percent.png
+gpu_memory_usage_percent.png
 ```
 
----
+## ROS 2 Image Capture Helper
 
-## Restarting from zero
+`colmap_ros2_cam.sh` is an optional helper for saving images from a ROS 2 camera topic into a folder that `colmap_live.sh` can watch.
 
-This deletes the COLMAP database, previous sparse models, PLY output, processed image list, and JSON stats log. It does **not** delete your images.
+Example:
+
+```bash
+./colmap_ros2_cam.sh \
+  -i /path/to/project/images \
+  -v /dev/video0 \
+  -h 1.0
+```
+
+Then run the live pipeline against the same image folder:
 
 ```bash
 ./colmap_live.sh \
-  --workspace /home/carlos/colmap_test/sequential \
-  --image-path /home/carlos/colmap_test/images \
-  --reset
+  --workspace /path/to/project/workspace \
+  --image-path /path/to/project/images \
+  --watch
 ```
 
-Or with config:
+## Resetting
+
+`--reset` deletes the COLMAP database, sparse models, PLY output, processed image list, stats JSON, resource JSON, and temporary folders inside the workspace. It does not delete your images.
 
 ```bash
 ./colmap_live.sh --config config.env --reset
 ```
 
----
+## Troubleshooting
 
-## Quick recommended command for your current paths
+If `sparse_live.ply` is poor but a full COLMAP GUI reconstruction works well, the live incremental model may have initialized too early or become weak. Keep the rebuild fallback enabled so the script can recover by running `mapper` over the accumulated database.
 
-From inside the downloaded `colmap_live_pipeline` folder:
+If GPU plots are empty, check that:
 
-```bash
-chmod +x colmap_live.sh
-chmod +x run_example_carlos_paths.sh
+- Resource monitoring was enabled.
+- `nvidia-smi` works in the terminal.
+- Your COLMAP build actually uses CUDA for SIFT extraction/matching.
 
-./run_example_carlos_paths.sh --reset
-```
-
-For live incoming images:
+If no sparse model appears after the first few images, add more overlapping images or increase sequential overlap:
 
 ```bash
-./run_example_carlos_paths.sh --watch
-```
-
-To inspect the JSON log:
-
-```bash
-cat /home/carlos/colmap_test/sequential/pointcloud_log.json
-```
-
-Or pretty-print it:
-
-```bash
-python3 -m json.tool /home/carlos/colmap_test/sequential/pointcloud_log.json
+--sequential-overlap 20
 ```

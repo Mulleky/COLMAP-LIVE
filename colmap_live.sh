@@ -3,6 +3,9 @@
 # COLMAP Live / Incremental Image Processor
 # Processes images one by one from a folder and incrementally updates a sparse model.
 #
+# v1.2.0 additions:
+#   - Optionally logs CPU, memory, and NVIDIA GPU usage during each run.
+#
 # v1.1.0 additions:
 #   - Appends JSON stats for every sparse point cloud/model generated or updated.
 #   - Tracks point count, registered images, processed images, camera count, and key COLMAP stats.
@@ -13,7 +16,7 @@
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 # ----------------------------
 # Defaults. These can be changed by config.env or command-line flags.
@@ -26,6 +29,7 @@ LIVE_MODEL_PATH="${LIVE_MODEL_PATH:-}"
 OUTPUT_PLY="${OUTPUT_PLY:-}"
 PROCESSED_LIST="${PROCESSED_LIST:-}"
 STATS_JSON="${STATS_JSON:-}"
+RESOURCE_JSON="${RESOURCE_JSON:-}"
 
 COLMAP_BIN="${COLMAP_BIN:-colmap}"
 
@@ -33,17 +37,24 @@ MATCHER="${MATCHER:-sequential}"             # sequential or exhaustive
 CAMERA_MODEL="${CAMERA_MODEL:-PINHOLE}"      # e.g. PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, OPENCV
 SINGLE_CAMERA="${SINGLE_CAMERA:-1}"          # 1 = assume all images share one camera
 SEQUENTIAL_OVERLAP="${SEQUENTIAL_OVERLAP:-10}"
+USE_GPU="${USE_GPU:-1}"                      # 1 = use GPU for SIFT extraction/matching when available
+GPU_INDEX="${GPU_INDEX:--1}"                 # -1 = COLMAP chooses GPU
 
 WATCH="${WATCH:-0}"
 POLL_SECONDS="${POLL_SECONDS:-3}"
 RUN_BA="${RUN_BA:-1}"
 EXPORT_PLY="${EXPORT_PLY:-1}"
 LOG_STATS="${LOG_STATS:-1}"
+LOG_RESOURCES="${LOG_RESOURCES:-1}"
+RESOURCE_SAMPLE_SECONDS="${RESOURCE_SAMPLE_SECONDS:-1}"
+REBUILD_ON_TRIANGULATION_FAILURE="${REBUILD_ON_TRIANGULATION_FAILURE:-1}"
 RESET="${RESET:-0}"
 WAIT_FOR_STABLE_FILE="${WAIT_FOR_STABLE_FILE:-1}"
 STABLE_FILE_SECONDS="${STABLE_FILE_SECONDS:-1}"
 
 CONFIG_FILE=""
+RESOURCE_MONITOR_PID=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ----------------------------
 # Logging helpers
@@ -82,10 +93,16 @@ Common options:
   --camera-model MODEL          COLMAP camera model. Default: ${CAMERA_MODEL}
   --single-camera 0|1           Treat all images as same camera. Default: ${SINGLE_CAMERA}
   --sequential-overlap N        Overlap for sequential matcher. Default: ${SEQUENTIAL_OVERLAP}
+  --use-gpu 0|1                 Use GPU for COLMAP SIFT extraction/matching. Default: ${USE_GPU}
+  --gpu-index INDEX             GPU index for COLMAP SIFT extraction/matching. Default: ${GPU_INDEX}
   --no-ba                       Skip bundle adjustment after updates.
   --no-ply                      Do not export sparse_live.ply.
   --no-stats                    Do not write JSON point cloud stats.
   --stats-json PATH             Optional JSON stats log path. Default: WORKSPACE/pointcloud_log.json
+  --no-resource-monitor         Do not log CPU/GPU resource usage.
+  --resource-json PATH          Optional resource usage JSON path. Default: WORKSPACE/resource_usage_log.json
+  --resource-sample-seconds N   Seconds between resource samples. Default: ${RESOURCE_SAMPLE_SECONDS}
+  --no-rebuild-fallback         Do not run mapper if incremental triangulation fails.
   --database-path PATH          Optional explicit database path. Default: WORKSPACE/database.db
   --live-model-path PATH        Optional explicit live model path. Default: WORKSPACE/sparse_live
   --output-ply PATH             Optional explicit PLY path. Default: WORKSPACE/sparse_live.ply
@@ -111,6 +128,10 @@ Examples:
 Stats JSON:
   The script appends one object per generated/updated sparse point cloud to:
     WORKSPACE/pointcloud_log.json
+
+Resource JSON:
+  The script logs CPU, memory, and NVIDIA GPU usage samples to:
+    WORKSPACE/resource_usage_log.json
 
 EOF
 }
@@ -180,6 +201,14 @@ parse_args() {
                 STATS_JSON="$2"
                 shift 2
                 ;;
+            --resource-json)
+                RESOURCE_JSON="$2"
+                shift 2
+                ;;
+            --resource-sample-seconds)
+                RESOURCE_SAMPLE_SECONDS="$2"
+                shift 2
+                ;;
             --colmap-bin)
                 COLMAP_BIN="$2"
                 shift 2
@@ -212,6 +241,14 @@ parse_args() {
                 SEQUENTIAL_OVERLAP="$2"
                 shift 2
                 ;;
+            --use-gpu)
+                USE_GPU="$2"
+                shift 2
+                ;;
+            --gpu-index)
+                GPU_INDEX="$2"
+                shift 2
+                ;;
             --no-ba)
                 RUN_BA="0"
                 shift
@@ -222,6 +259,14 @@ parse_args() {
                 ;;
             --no-stats)
                 LOG_STATS="0"
+                shift
+                ;;
+            --no-resource-monitor)
+                LOG_RESOURCES="0"
+                shift
+                ;;
+            --no-rebuild-fallback)
+                REBUILD_ON_TRIANGULATION_FAILURE="0"
                 shift
                 ;;
             --no-stable-file-wait)
@@ -259,6 +304,7 @@ resolve_defaults() {
     OUTPUT_PLY="${OUTPUT_PLY:-$WORKSPACE/sparse_live.ply}"
     PROCESSED_LIST="${PROCESSED_LIST:-$WORKSPACE/processed_images.txt}"
     STATS_JSON="${STATS_JSON:-$WORKSPACE/pointcloud_log.json}"
+    RESOURCE_JSON="${RESOURCE_JSON:-$WORKSPACE/resource_usage_log.json}"
 
     LIST_DIR="$WORKSPACE/lists"
     TMP_DIR="$WORKSPACE/tmp"
@@ -279,8 +325,14 @@ resolve_defaults() {
     fi
 
     if ! command -v python3 >/dev/null 2>&1; then
-        err "python3 is required for JSON stats logging."
-        err "Install python3 or run with --no-stats."
+        err "python3 is required for JSON stats/resource logging."
+        err "Install python3 or run with --no-stats --no-resource-monitor."
+        exit 1
+    fi
+
+    if [ "$LOG_RESOURCES" = "1" ] && [ ! -f "$SCRIPT_DIR/monitor_system_usage.py" ]; then
+        err "Resource monitor script not found: $SCRIPT_DIR/monitor_system_usage.py"
+        err "Restore it or run with --no-resource-monitor."
         exit 1
     fi
 
@@ -302,6 +354,7 @@ reset_project() {
     rm -f "$OUTPUT_PLY"
     rm -f "$PROCESSED_LIST"
     rm -f "$STATS_JSON"
+    rm -f "$RESOURCE_JSON"
     rm -rf "$LIVE_MODEL_PATH"
     rm -rf "$WORKSPACE/sparse_live_previous"
     rm -rf "$TMP_DIR"
@@ -319,15 +372,54 @@ print_config_summary() {
     echo "  OUTPUT_PLY:           $OUTPUT_PLY"
     echo "  PROCESSED_LIST:       $PROCESSED_LIST"
     echo "  STATS_JSON:           $STATS_JSON"
+    echo "  RESOURCE_JSON:        $RESOURCE_JSON"
     echo "  MATCHER:              $MATCHER"
     echo "  CAMERA_MODEL:         $CAMERA_MODEL"
     echo "  SINGLE_CAMERA:        $SINGLE_CAMERA"
     echo "  SEQUENTIAL_OVERLAP:   $SEQUENTIAL_OVERLAP"
+    echo "  USE_GPU:              $USE_GPU"
+    echo "  GPU_INDEX:            $GPU_INDEX"
     echo "  RUN_BA:               $RUN_BA"
     echo "  EXPORT_PLY:           $EXPORT_PLY"
     echo "  LOG_STATS:            $LOG_STATS"
+    echo "  LOG_RESOURCES:        $LOG_RESOURCES"
+    echo "  RESOURCE_SAMPLE_SEC:  $RESOURCE_SAMPLE_SECONDS"
+    echo "  REBUILD_ON_TRI_FAIL:  $REBUILD_ON_TRIANGULATION_FAILURE"
     echo "  WATCH:                $WATCH"
     echo "  POLL_SECONDS:         $POLL_SECONDS"
+}
+
+start_resource_monitor() {
+    if [ "$LOG_RESOURCES" != "1" ]; then
+        return 0
+    fi
+
+    info "Starting resource monitor: $RESOURCE_JSON"
+    python3 "$SCRIPT_DIR/monitor_system_usage.py" \
+        --output-json "$RESOURCE_JSON" \
+        --sample-seconds "$RESOURCE_SAMPLE_SECONDS" \
+        --run-label "colmap_live" &
+    RESOURCE_MONITOR_PID=$!
+}
+
+stop_resource_monitor() {
+    if [ -z "$RESOURCE_MONITOR_PID" ]; then
+        return 0
+    fi
+
+    if kill -0 "$RESOURCE_MONITOR_PID" 2>/dev/null; then
+        info "Stopping resource monitor..."
+        kill "$RESOURCE_MONITOR_PID" 2>/dev/null
+        wait "$RESOURCE_MONITOR_PID" 2>/dev/null
+    fi
+
+    RESOURCE_MONITOR_PID=""
+}
+
+cleanup_and_exit() {
+    local exit_code=$?
+    stop_resource_monitor
+    exit "$exit_code"
 }
 
 is_image_file() {
@@ -589,11 +681,15 @@ run_matcher() {
         "$COLMAP_BIN" sequential_matcher \
             --database_path "$DATABASE_PATH" \
             --SequentialMatching.overlap "$SEQUENTIAL_OVERLAP" \
+            --SiftMatching.use_gpu "$USE_GPU" \
+            --SiftMatching.gpu_index "$GPU_INDEX" \
             2>&1 | tee "$log_file"
     else
         info "Running exhaustive matcher..."
         "$COLMAP_BIN" exhaustive_matcher \
             --database_path "$DATABASE_PATH" \
+            --SiftMatching.use_gpu "$USE_GPU" \
+            --SiftMatching.gpu_index "$GPU_INDEX" \
             2>&1 | tee "$log_file"
     fi
 
@@ -633,6 +729,142 @@ find_first_model_folder() {
     done
 }
 
+count_sparse_points_in_model() {
+    local model_path="$1"
+
+    if [ ! -f "$model_path/points3D.bin" ]; then
+        echo 0
+        return 0
+    fi
+
+    local count_txt_dir
+    count_txt_dir=$(mktemp -d "$TMP_DIR/model_count_XXXXXX")
+
+    "$COLMAP_BIN" model_converter \
+        --input_path "$model_path" \
+        --output_path "$count_txt_dir" \
+        --output_type TXT \
+        >/dev/null 2>&1
+
+    if [ $? -ne 0 ] || [ ! -f "$count_txt_dir/points3D.txt" ]; then
+        rm -rf "$count_txt_dir"
+        echo 0
+        return 0
+    fi
+
+    awk '
+        /^# Number of points:/ {
+            gsub(",", "", $5)
+            print $5
+            found=1
+            exit
+        }
+        END {
+            if (!found) {
+                count=0
+                while ((getline line < ARGV[1]) > 0) {
+                    if (line !~ /^#/ && line !~ /^[[:space:]]*$/) {
+                        count++
+                    }
+                }
+                print count
+            }
+        }
+    ' "$count_txt_dir/points3D.txt"
+
+    rm -rf "$count_txt_dir"
+}
+
+find_best_model_folder() {
+    local parent="$1"
+    local best_model=""
+    local best_points=-1
+
+    while IFS= read -r d; do
+        if [ -f "$d/images.bin" ] && [ -f "$d/cameras.bin" ] && [ -f "$d/points3D.bin" ]; then
+            local point_count
+            point_count=$(count_sparse_points_in_model "$d")
+
+            if [ "$point_count" -gt "$best_points" ]; then
+                best_points="$point_count"
+                best_model="$d"
+            fi
+        fi
+    done < <(find "$parent" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    if [ -n "$best_model" ]; then
+        echo "$best_model"
+    fi
+}
+
+replace_live_model_from() {
+    local new_model_dir="$1"
+    local event_name="$2"
+    local trigger_image="$3"
+
+    rm -rf "$WORKSPACE/sparse_live_previous"
+    if [ -d "$LIVE_MODEL_PATH" ]; then
+        cp -r "$LIVE_MODEL_PATH" "$WORKSPACE/sparse_live_previous"
+    fi
+
+    rm -rf "$LIVE_MODEL_PATH"
+    cp -r "$new_model_dir" "$LIVE_MODEL_PATH"
+
+    info "Live model updated: $LIVE_MODEL_PATH"
+    export_ply_if_requested
+    append_pointcloud_stats_json "$event_name" "$trigger_image"
+}
+
+rebuild_model_from_database() {
+    local trigger_image="$1"
+    local reason="$2"
+
+    if [ "$REBUILD_ON_TRIANGULATION_FAILURE" != "1" ]; then
+        warn "Rebuild fallback disabled. Keeping previous live model."
+        export_ply_if_requested
+        return 0
+    fi
+
+    local rebuild_dir="$TMP_DIR/rebuild_mapper"
+    rm -rf "$rebuild_dir"
+    mkdir -p "$rebuild_dir"
+
+    info "Running full mapper rebuild from accumulated database because: $reason"
+
+    local rebuild_log="$LOG_DIR/mapper_rebuild_$(date +%Y%m%d_%H%M%S).log"
+
+    "$COLMAP_BIN" mapper \
+        --database_path "$DATABASE_PATH" \
+        --image_path "$IMAGE_PATH" \
+        --output_path "$rebuild_dir" \
+        2>&1 | tee "$rebuild_log"
+
+    local mapper_status=${PIPESTATUS[0]}
+    local best_model
+    best_model=$(find_best_model_folder "$rebuild_dir" || true)
+
+    if [ "$mapper_status" -ne 0 ] || [ -z "$best_model" ]; then
+        warn "Mapper rebuild did not produce a usable model. Keeping previous live model."
+        export_ply_if_requested
+        return 0
+    fi
+
+    local current_points
+    local rebuilt_points
+    current_points=$(count_sparse_points_in_model "$LIVE_MODEL_PATH")
+    rebuilt_points=$(count_sparse_points_in_model "$best_model")
+
+    if [ "$rebuilt_points" -lt "$current_points" ]; then
+        warn "Mapper rebuild produced fewer points ($rebuilt_points) than current model ($current_points). Keeping previous live model."
+        export_ply_if_requested
+        return 0
+    fi
+
+    info "Mapper rebuild selected model: $best_model ($rebuilt_points sparse points)."
+    replace_live_model_from "$best_model" "rebuilt" "$trigger_image"
+    return 0
+}
+
 try_initialize_model() {
     local trigger_image="$1"
 
@@ -652,15 +884,11 @@ try_initialize_model() {
     local mapper_status=${PIPESTATUS[0]}
 
     local model_folder
-    model_folder=$(find_first_model_folder "$INIT_OUTPUT_DIR" || true)
+    model_folder=$(find_best_model_folder "$INIT_OUTPUT_DIR" || true)
 
     if [ "$mapper_status" -eq 0 ] && [ -n "$model_folder" ]; then
         info "Initial sparse model created: $model_folder"
-        rm -rf "$LIVE_MODEL_PATH"
-        cp -r "$model_folder" "$LIVE_MODEL_PATH"
-
-        export_ply_if_requested
-        append_pointcloud_stats_json "initialized" "$trigger_image"
+        replace_live_model_from "$model_folder" "initialized" "$trigger_image"
         return 0
     fi
 
@@ -709,12 +937,22 @@ update_existing_model() {
     local tri_status=${PIPESTATUS[0]}
 
     if [ "$tri_status" -ne 0 ] || [ ! -f "$TRIANGULATE_DIR/images.bin" ]; then
-        warn "point_triangulator failed. Keeping previous live model."
-        export_ply_if_requested
+        warn "point_triangulator failed."
+        rebuild_model_from_database "$trigger_image" "point_triangulator failed"
         return 0
     fi
 
     local NEW_MODEL_DIR="$TRIANGULATE_DIR"
+    local live_points_before
+    local tri_points
+    live_points_before=$(count_sparse_points_in_model "$LIVE_MODEL_PATH")
+    tri_points=$(count_sparse_points_in_model "$TRIANGULATE_DIR")
+
+    if [ "$tri_points" -lt "$live_points_before" ]; then
+        warn "point_triangulator produced fewer points ($tri_points) than the current live model ($live_points_before)."
+        rebuild_model_from_database "$trigger_image" "incremental triangulation degraded the model"
+        return 0
+    fi
 
     if [ "$RUN_BA" = "1" ]; then
         local ba_log="$LOG_DIR/bundle_adjuster_$(date +%Y%m%d_%H%M%S).log"
@@ -734,17 +972,7 @@ update_existing_model() {
         fi
     fi
 
-    rm -rf "$WORKSPACE/sparse_live_previous"
-    if [ -d "$LIVE_MODEL_PATH" ]; then
-        cp -r "$LIVE_MODEL_PATH" "$WORKSPACE/sparse_live_previous"
-    fi
-
-    rm -rf "$LIVE_MODEL_PATH"
-    cp -r "$NEW_MODEL_DIR" "$LIVE_MODEL_PATH"
-
-    info "Live model updated: $LIVE_MODEL_PATH"
-    export_ply_if_requested
-    append_pointcloud_stats_json "updated" "$trigger_image"
+    replace_live_model_from "$NEW_MODEL_DIR" "updated" "$trigger_image"
     return 0
 }
 
@@ -791,6 +1019,8 @@ process_one_image() {
         --image_list_path "$list_file" \
         --ImageReader.single_camera "$SINGLE_CAMERA" \
         --ImageReader.camera_model "$CAMERA_MODEL" \
+        --SiftExtraction.use_gpu "$USE_GPU" \
+        --SiftExtraction.gpu_index "$GPU_INDEX" \
         2>&1 | tee "$LOG_DIR/feature_extractor_$(date +%Y%m%d_%H%M%S).log"
 
     local feature_status=${PIPESTATUS[0]}
@@ -832,6 +1062,8 @@ process_all_available_images() {
 }
 
 main() {
+    trap cleanup_and_exit EXIT INT TERM
+
     preparse_config "$@"
     parse_args "$@"
     resolve_defaults
@@ -841,6 +1073,7 @@ main() {
     fi
 
     print_config_summary
+    start_resource_monitor
 
     if [ "$WATCH" = "1" ]; then
         info "Watch mode enabled. Press Ctrl+C to stop."
@@ -854,6 +1087,7 @@ main() {
         info "Current live model path: $LIVE_MODEL_PATH"
         info "Current PLY path:        $OUTPUT_PLY"
         info "JSON stats log path:     $STATS_JSON"
+        info "Resource JSON log path:  $RESOURCE_JSON"
     fi
 }
 
